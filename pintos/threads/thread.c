@@ -61,6 +61,8 @@ static void init_thread(struct thread *, const char *name, int priority); // 스
 static void do_schedule(int status);                                      // 상태 설정 후 스케줄링 진입
 static void schedule(void);                                               // 컨텍스트 스위칭 드라이버
 static tid_t allocate_tid(void);                                          // 고유 tid 할당
+bool compare_thread_priority(const struct list_elem *a, const struct list_elem *b, void *aux UNUSED);
+void donate_priority_chain(struct thread *donee);
 
 /* T가 유효한 스레드를 가리키는지 여부 반환. */
 // 스택 구조체의 맨 마지막인 magic이 변했는지를 검증.
@@ -210,6 +212,11 @@ tid_t thread_create(const char *name, int priority, thread_func *function, void 
     /* 준비 큐에 추가 */
     thread_unblock(t); // 준비 큐에 넣어 READY 상태로 전이
 
+    // 새 스레드가 우선순위 높으면 현재 스레드를 양보
+    if (t->priority > thread_current()->priority) {
+        thread_yield();
+    }
+
     return tid; // 새 스레드의 tid 반환
 }
 
@@ -231,15 +238,36 @@ void thread_block(void) {
    이 함수는 현재 실행 중인 스레드를 선점하지 않는다. 호출자가 인터럽트를 직접 비활성화한 경우,
    스레드를 원자적으로 깨우고 다른 데이터를 갱신하기를 기대할 수 있기 때문이다. */
 void thread_unblock(struct thread *t) {
-    enum intr_level old_level; // 인터럽트 상태 저장용
+    enum intr_level old_level;  // 인터럽트 상태 저장용
+    old_level = intr_disable(); // 원자적 조작 위해 인터럽트 비활성
 
     ASSERT(is_thread(t)); // 유효 스레드 확인
+    ASSERT(t->status == THREAD_BLOCKED);
 
-    old_level = intr_disable();            // 원자적 조작 위해 인터럽트 비활성
-    ASSERT(t->status == THREAD_BLOCKED);   // BLOCKED 상태여야 함
-    list_push_back(&ready_list, &t->elem); // 준비 큐 꼬리에 삽입
-    t->status = THREAD_READY;              // READY 상태로 변경
-    intr_set_level(old_level);             // 인터럽트 복원
+    // READY 큐에 우선순위 정렬 삽입 방식으로 변경
+    /**
+     * READY 큐는 “우선순위 내림차순”으로 관리
+     * 인터럽트가 아닌 상황에서는 우선순위가 더 높은 스레드가 준비되면 즉시 선점
+     * 인터럽트 중에는 intr_yield_on_return()으로 “리턴 직전 양보” 플래그만 설정
+     */
+    list_insert_ordered(&ready_list, &t->elem, compare_thread_priority, NULL);
+    t->status = THREAD_READY; // 이제 스케줄 대상임
+    // 현재 컨텍스트에 따라 선점 요청
+    if (intr_context()) {
+        // 인터럽트 컨텍스트에서는 리턴 직전 양보만 표시
+        intr_yield_on_return();
+    } else {
+        // 일반 컨텍스트에서는 우선순위가 더 높은 스레드가 준비되면 즉시 양보
+        if (t->priority > thread_current()->priority) {
+            thread_yield();
+        }
+    }
+
+    // 기본 pintos 큐 방식(Round Robin 방식)
+    // ASSERT(t->status == THREAD_BLOCKED);   // BLOCKED 상태여야 함
+    // list_push_back(&ready_list, &t->elem); // 준비 큐 꼬리에 삽입
+    // t->status = THREAD_READY;              // READY 상태로 변경
+    intr_set_level(old_level); // 인터럽트 복원
 }
 
 /* 현재 실행 중인 스레드의 이름 반환 */
@@ -292,16 +320,31 @@ void thread_yield(void) {
 
     ASSERT(!intr_context());
 
-    old_level = intr_disable();                   // 원자적 큐 조작 준비
-    if (curr != idle_thread)                      // idle이 아니면
-        list_push_back(&ready_list, &curr->elem); // 준비 큐에 재삽입
-    do_schedule(THREAD_READY);                    // READY로 전환하고 스케줄링
-    intr_set_level(old_level);                    // 인터럽트 복원
+    old_level = intr_disable(); // 원자적 큐 조작 준비
+    if (curr != idle_thread)    // idle이 아니면
+                                // 정렬 삽입으로 변경
+        list_insert_ordered(&ready_list, &curr->elem, compare_thread_priority, NULL);
+    do_schedule(THREAD_READY); // READY로 전환하고 스케줄링
+    intr_set_level(old_level); // 인터럽트 복원
 }
 
 /* 현재 스레드의 우선순위를 NEW_PRIORITY로 설정 */
 void thread_set_priority(int new_priority) {
-    thread_current()->priority = new_priority; // 현재 스레드 우선순위 갱신
+    struct thread *cur = thread_current();
+    cur->base_priority = new_priority;
+
+    // 현재 donation 영향이 없다면 즉시 반영, 있으면 refresh가 올려줌
+    refresh_priority(cur);
+
+    // 내가 낮아졌고, 레디에 나보다 높은 스레드가 있으면 양보
+    enum intr_level old = intr_disable();
+    if (!list_empty(&ready_list)) {
+        struct thread *top = list_entry(list_front(&ready_list), struct thread, elem);
+        if (top->priority > cur->priority) {
+            thread_yield();
+        }
+    }
+    intr_set_level(old);
 }
 
 /* 현재 스레드의 우선순위 반환 */
@@ -379,8 +422,13 @@ static void init_thread(struct thread *t, const char *name, int priority) {
     t->status = THREAD_BLOCKED;                        // 초기 상태는 BLOCKED
     strlcpy(t->name, name, sizeof t->name);            // 이름 설정(버퍼 크기 안전)
     t->tf.rsp = (uint64_t)t + PGSIZE - sizeof(void *); // 초기 스택 포인터 설정(페이지 끝)
-    t->priority = priority;                            // 우선순위 설정
-    t->magic = THREAD_MAGIC;                           // 매직 값 설정(오버플로 감지)
+    t->priority = priority;                            // 우선순위 설정(유효 우선순위)
+    t->base_priority = priority;                       // 원래(base) 우선순위
+    list_init(&t->donations);                          // 기부자 리스트 초기화
+    // list_init(&t->donation_elem);
+    list_init(&t->held_locks); // 보유 락 리스트 초기화
+    t->wait_on_lock = NULL;    // 대기 중인 락 없음
+    t->magic = THREAD_MAGIC;   // 매직 값 설정(오버플로 감지)
 }
 
 /* 다음에 스케줄할 스레드를 선택하여 반환한다. 준비 큐가 비어 있지 않다면
@@ -419,6 +467,65 @@ void do_iret(struct intr_frame *tf) {
                      :
                      : "g"((uint64_t)tf)
                      : "memory"); // tf를 스택 프레임으로 사용하여 복귀
+}
+
+// 유효 우선순위 갱신
+void refresh_priority(struct thread *t) {
+    t->priority = t->base_priority;
+    if (!list_empty(&t->donations)) {
+        // donations 리스트는 우선순위 내림차순 정렬
+        struct thread *top = list_entry(list_front(&t->donations), struct thread, donation_elem);
+        if (top->priority > t->priority) {
+            t->priority = top->priority;
+        }
+    }
+}
+
+static bool compare_donation_prio(const struct list_elem *a, const struct list_elem *b, void *aux UNUSED) {
+    const struct thread *da = list_entry(a, struct thread, donation_elem);
+    const struct thread *db = list_entry(b, struct thread, donation_elem);
+    return da->priority > db->priority;
+}
+
+// 우선순위 기부를 체인으로 전파 - Nested Donation 방식
+// 현재 스레드(cur)가 어떤 락을 기다리는 중이고, 그 락의 소유자(donee)가 나보다 우선순위가 낮다면 donee의 우선순위를
+// 끌어올리고, donee가 또 다른 락을 기다리고 있으면 그 락의 소유자에게도 계속(최대 깊이까지) 기부를 전파한다
+void donate_priority_chain(struct thread *donee) {
+    int depth = 0;                          // 최대 깊이 전파 제한 카운터 (무한루프 방지용)
+    struct thread *cur = thread_current();  // 기부를 시작하는 현재 스레드(최초 donor)
+    int donated_pri = cur->priority;        // 전파할 우선순위(체인 진행 시 갱신)
+
+    while (donee && depth++ < DONATION_DEPTH_LIMIT) {
+        // 최초 단계에서는 현재 스레드를 donee의 donations에 등록(중복 제거 후 삽입)
+        if (depth == 1) {
+            struct list_elem *e;
+            for (e = list_begin(&donee->donations); e != list_end(&donee->donations);) {
+                struct thread *d = list_entry(e, struct thread, donation_elem);
+                if (d == cur) {
+                    e = list_remove(e);
+                    break;
+                } else {
+                    e = list_next(e);
+                }
+            }
+            list_insert_ordered(&donee->donations, &cur->donation_elem, compare_donation_prio, NULL);
+        }
+
+        // donee의 유효 우선순위를 새로 계산한 뒤, 필요한 경우 donated_pri까지 끌어올림
+        refresh_priority(donee);
+        if (donee->priority < donated_pri) {
+            donee->priority = donated_pri;
+        }
+
+        // 다음 전파 대상 탐색: donee가 또 다른 락을 기다리는 중이면 그 락의 holder로 전파
+        if (donee->wait_on_lock && donee->wait_on_lock->holder != donee) {
+            // 다음 단계에서 전파할 우선순위는 방금 상향된 donee의 우선순위
+            donated_pri = donee->priority;
+            donee = donee->wait_on_lock->holder;
+        } else {
+            break;
+        }
+    }
 }
 
 /* 새 스레드의 페이지 테이블을 활성화하여 스레드를 전환하고,
@@ -544,4 +651,13 @@ static tid_t allocate_tid(void) {
     lock_release(&tid_lock); // 락 해제
 
     return tid; // 새 tid 반환
+}
+
+// 스레드 우선순위 비교자 - args : 리스트 노드 포인터 a, b를 받아옴
+bool compare_thread_priority(const struct list_elem *a, const struct list_elem *b, void *aux UNUSED) {
+    // a, b가 속한 스레드 구조체를 복원
+    const struct thread *ta = list_entry(a, struct thread, elem);
+    const struct thread *tb = list_entry(b, struct thread, elem);
+    // a가 더 크면 true -> 우선순위가 높은 스레드를 리스트의 앞쪽에 오게 한다.
+    return ta->priority > tb->priority;
 }
