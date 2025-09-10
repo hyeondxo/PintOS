@@ -1,4 +1,5 @@
-#include "threads/thread.h"     // 스레드 구조체와 스케줄러 관련 기본 선언
+#include "threads/thread.h" // 스레드 구조체와 스케줄러 관련 기본 선언
+#include "devices/timer.h"
 #include "intrinsic.h"          // 낮은 수준의 레지스터 접근(rrsp 등)
 #include "threads/flags.h"      // EFLAGS 비트 정의
 #include "threads/interrupt.h"  // 인터럽트 제어/상태 관련
@@ -23,6 +24,9 @@
    이 값은 변경하면 안 됨. */
 #define THREAD_BASIC 0xd42df210 // 기본 스레드 식별용 상수(변경 금지)
 
+/* 고정소수점 유틸: 17.14 형식 */
+#define F (1 << 14)
+
 /* THREAD_READY 상태, 즉 실행 준비는 되었으나 아직 실행 중은 아닌
    스레드들의 리스트(준비 큐). */
 static struct list ready_list; // READY 상태 스레드들이 대기하는 준비 큐
@@ -38,6 +42,11 @@ static struct lock tid_lock; // tid 할당 시 동시성 보호용 락
 
 /* 스레드 파괴(해제) 요청 큐 */
 static struct list destruction_req; // 파괴(해제) 대기중인 스레드 목록
+
+/* 모든 스레드 (idle 포함해도 되고, 계산 시 idle는 건너뜀) */
+static struct list all_list;
+/* FP(고정소수점) 값, 초기 0 */
+static int load_avg;
 
 /* 통계 */
 static long long idle_ticks;   /* 유휴 상태에 소비된 틱 수 */
@@ -97,6 +106,26 @@ void donate_priority_chain(struct thread *donee);
 // 쉽게 64비트에선 커널 모드인지 유저 모드인지 권한을 구분한다고 생각하면 됨
 static uint64_t gdt[3] = {0, 0x00af9a000000ffff, 0x00cf92000000ffff}; // 임시 GDT (커널 코드/데이터)
 
+/* int, fp 변환 */
+#define INT_TO_FP(n) ((n) * (F))
+#define FP_TO_INT_ZERO(x) ((x) / (F))                                                   /* 버림 */
+#define FP_TO_INT_NEAREST(x) ((x) >= 0 ? ((x) + (F) / 2) / (F) : ((x) - (F) / 2) / (F)) /* 반올림 */
+
+/* 기본 연산 */
+#define FP_ADD_FP(x, y) ((x) + (y))
+#define FP_SUB_FP(x, y) ((x) - (y))
+#define FP_ADD_INT(x, n) ((x) + (n) * (F))
+#define FP_SUB_INT(x, n) ((x) - (n) * (F))
+
+/* 곱셈/나눗셈 */
+#define FP_MUL_FP(x, y) (((int64_t)(x)) * (y) / (F))
+#define FP_MUL_INT(x, n) ((x) * (n))
+#define FP_DIV_FP(x, y) (((int64_t)(x)) * (F) / (y))
+#define FP_DIV_INT(x, n) ((x) / (n))
+
+/* clamp 제한 */
+#define CLAMP_PRI(p) ((p) > PRI_MAX ? PRI_MAX : ((p) < PRI_MIN ? PRI_MIN : (p)))
+
 /* 현재 실행 중인 코드를 스레드로 승격하여 스레드 시스템을 초기화한다.
    일반적으로는 불가능하지만, loader.S가 스택 하단을 페이지 경계에 맞춰 두었기 때문에 가능하다.
 
@@ -124,9 +153,13 @@ void thread_init(void) {
     list_init(&ready_list);      // 준비 큐 초기화
     list_init(&destruction_req); // 파괴 요청 리스트 초기화
 
+    /* MLFQS 전역 초기화는 최초 스레드 등록 전에 수행 */
+    list_init(&all_list);
+    load_avg = INT_TO_FP(0);
+
     /* 현재 실행 중인 코드를 위한 스레드 구조체 설정 */
     initial_thread = running_thread();                // 재 스택의 페이지 시작을 struct thread*로 캐스팅
-    init_thread(initial_thread, "main", PRI_DEFAULT); // 이름/우선순위 설정
+    init_thread(initial_thread, "main", PRI_DEFAULT); // 이름/우선순위 설정 (all_list에 등록됨)
     initial_thread->status = THREAD_RUNNING;          // 현재 실행 중 표시
     initial_thread->tid = allocate_tid();             // tid 부여
 }
@@ -208,6 +241,13 @@ tid_t thread_create(const char *name, int priority, thread_func *function, void 
     t->tf.ss = SEL_KDSEG;                 // 스택 세그먼트
     t->tf.cs = SEL_KCSEG;                 // 코드 세그먼트
     t->tf.eflags = FLAG_IF;               // 인터럽트 허용 플래그 설정
+
+    /* 부모 값 상속 (문서 권고) */
+    if (thread_mlfqs) {
+        t->nice = thread_current()->nice;
+        t->recent_cpu = thread_current()->recent_cpu;
+        mlfqs_priority(t); /* 생성 직후 우선순위 산정 */
+    }
 
     /* 준비 큐에 추가 */
     thread_unblock(t); // 준비 큐에 넣어 READY 상태로 전이
@@ -307,9 +347,10 @@ void thread_exit(void) {
 
     /* 상태를 DYING으로 설정한 뒤 다른 스레드를 스케줄한다.
        실제 파괴는 schedule_tail() 경로에서 수행된다. */
-    intr_disable();            // 스케줄링 전 인터럽트 비활성
-    do_schedule(THREAD_DYING); // 상태를 DYING으로 바꾸고 전환
-    NOT_REACHED();             // 여기 도달하면 오류
+    intr_disable();                          // 스케줄링 전 인터럽트 비활성
+    list_remove(&thread_current()->allelem); /* 누수 방지 */
+    do_schedule(THREAD_DYING);               // 상태를 DYING으로 바꾸고 전환
+    NOT_REACHED();                           // 여기 도달하면 오류
 }
 
 /* CPU를 양보한다. 현재 스레드는 수면 상태로 가지 않으며,
@@ -330,6 +371,10 @@ void thread_yield(void) {
 
 /* 현재 스레드의 우선순위를 NEW_PRIORITY로 설정 */
 void thread_set_priority(int new_priority) {
+    // MLFQS 모드에서는 무시
+    if (thread_mlfqs) {
+        return;
+    }
     struct thread *cur = thread_current();
     cur->base_priority = new_priority;
 
@@ -353,24 +398,47 @@ int thread_get_priority(void) {
 }
 
 /* 현재 스레드의 nice 값을 NICE로 설정(MLFQS 관련) */
-void thread_set_nice(int nice UNUSED) { /* TODO: mlfqs nice 값 설정(프로젝트 확장 과제) */ }
+void thread_set_nice(int nice) {
+    /* TODO: mlfqs nice 값 설정(프로젝트 확장 과제) */
+    struct thread *cur = thread_current();
+    // 보통 -20~20로 clamp
+    if (nice < -20) {
+        nice = -20;
+    } else if (nice > 20) {
+        nice = 20;
+    }
+
+    cur->nice = nice;
+    // 내 priority 재계산
+    mlfqs_priority(cur);
+
+    enum intr_level old = intr_disable();
+    // 갱신된 우선순위에 맞게 재선점
+    if (!list_empty(&ready_list)) {
+        struct thread *top = list_entry(list_front(&ready_list), struct thread, elem);
+        if (top->priority > cur->priority) {
+            thread_yield();
+        }
+    }
+    intr_set_level(old);
+}
 
 /* 현재 스레드의 nice 값 반환 */
 int thread_get_nice(void) {
     /* TODO: mlfqs nice 값 조회 */
-    return 0;
+    return thread_current()->nice;
 }
 
 /* 시스템 load average * 100 반환 */
 int thread_get_load_avg(void) {
     /* TODO: 시스템 load average*100 반환 */
-    return 0;
+    return FP_TO_INT_NEAREST(FP_MUL_INT(load_avg, 100));
 }
 
 /* 현재 스레드의 recent_cpu * 100 반환 */
 int thread_get_recent_cpu(void) {
     /* TODO: 현재 스레드의 recent_cpu*100 반환 */
-    return 0;
+    return FP_TO_INT_NEAREST(FP_MUL_INT(thread_current()->recent_cpu, 100));
 }
 
 /* 유휴 스레드. 다른 실행 가능한 스레드가 없을 때 실행된다.
@@ -429,6 +497,11 @@ static void init_thread(struct thread *t, const char *name, int priority) {
     list_init(&t->held_locks); // 보유 락 리스트 초기화
     t->wait_on_lock = NULL;    // 대기 중인 락 없음
     t->magic = THREAD_MAGIC;   // 매직 값 설정(오버플로 감지)
+
+    t->nice = 0;                  /* 기본값 */
+    t->recent_cpu = INT_TO_FP(0); /* 0 */
+
+    list_push_back(&all_list, &t->allelem); /* 모든 스레드 목록에 등록 */
 }
 
 /* 다음에 스케줄할 스레드를 선택하여 반환한다. 준비 큐가 비어 있지 않다면
@@ -491,9 +564,9 @@ static bool compare_donation_prio(const struct list_elem *a, const struct list_e
 // 현재 스레드(cur)가 어떤 락을 기다리는 중이고, 그 락의 소유자(donee)가 나보다 우선순위가 낮다면 donee의 우선순위를
 // 끌어올리고, donee가 또 다른 락을 기다리고 있으면 그 락의 소유자에게도 계속(최대 깊이까지) 기부를 전파한다
 void donate_priority_chain(struct thread *donee) {
-    int depth = 0;                          // 최대 깊이 전파 제한 카운터 (무한루프 방지용)
-    struct thread *cur = thread_current();  // 기부를 시작하는 현재 스레드(최초 donor)
-    int donated_pri = cur->priority;        // 전파할 우선순위(체인 진행 시 갱신)
+    int depth = 0;                         // 최대 깊이 전파 제한 카운터 (무한루프 방지용)
+    struct thread *cur = thread_current(); // 기부를 시작하는 현재 스레드(최초 donor)
+    int donated_pri = cur->priority;       // 전파할 우선순위(체인 진행 시 갱신)
 
     while (donee && depth++ < DONATION_DEPTH_LIMIT) {
         // 최초 단계에서는 현재 스레드를 donee의 donations에 등록(중복 제거 후 삽입)
@@ -660,4 +733,128 @@ bool compare_thread_priority(const struct list_elem *a, const struct list_elem *
     const struct thread *tb = list_entry(b, struct thread, elem);
     // a가 더 크면 true -> 우선순위가 높은 스레드를 리스트의 앞쪽에 오게 한다.
     return ta->priority > tb->priority;
+}
+
+// 현재 시점의 ready_threads값을 구함 - load_avg 계산에 사용
+static int get_ready_threads_count(void) {
+    // CPU를 잡지 못하고 대기 중인 스레드 수
+    int n = (int)list_size(&ready_list);
+    // 현재 실행 중인 스레드가 idle이 아니라면 1개 더함
+    // BSD/MLFQS에서 load_avg는 “RUNNABLE한 스레드 수(=ready + running)”로 정의되기 때문
+    if (thread_current() != idle_thread)
+        n += 1;
+    return n;
+}
+
+// 매 틱마다 현재 실행중인 스레드의 recent_cpu를 +1함. MLFQS 규칙
+void mlfqs_increment(void) {
+    struct thread *cur = thread_current();
+    if (cur == idle_thread)
+        return;
+    cur->recent_cpu = FP_ADD_INT(cur->recent_cpu, 1);
+}
+
+/**
+ * MLFQS의 시스템 부하(load_avg)를 계산
+ * 시스템에 지금 당장 실행 가능한 스레드가 몇 개인지를 반영하는 지표임
+ * 수식 : load_avg = (59/60)*load_avg + (1/60)*ready
+ *
+ * 수식이 왜 이렇게 구성되는가?
+ * 단순히 “ready_threads 개수”를 쓰면, 순간적인 요동(예: 갑자기 하나 늘었다 줄었다)이 그대로 반영돼서 너무 들쭉날쭉함
+ * 그래서 평균을 사용 - 오래된 값도 고려하되, 최근의 값에 조금 더 비중을 두기
+ * 앞부분(59/60 × load_avg) -> 지난 load_avg를 “아직도 59/60 만큼은 유효하다”고 보는 것.
+ * 뒷부분(1/60 × ready) -> 최근의 ready_threads를 “새로운 정보 1/60 만큼 반영한다”는 것.
+ * 두 계수를 합치면 1이 됨. (59/60 + 1/60 = 1) - 즉, 전체 평균 중 98.3%는 과거 추세, 1.7%는 현재 상황을 반영하는 꼴
+ *
+ * load_avg (새로운 값) = 이전 load_avg의 98.3% + 현재 ready_threads의 1.7%
+ * 즉, 현재 값은 조금만 반영, 과거 값은 많이 유지 -> 부드럽게 변함
+ */
+void mlfqs_load_avg(void) {
+    int ready = get_ready_threads_count(); // 정수
+    int term1 = FP_MUL_FP(FP_DIV_INT(INT_TO_FP(59), 60), load_avg);
+    int term2 = FP_MUL_FP(FP_DIV_INT(INT_TO_FP(1), 60), INT_TO_FP(ready));
+    load_avg = FP_ADD_FP(term1, term2);
+}
+
+/**
+ * MLFQS 스케줄러에서 각 스레드의 최근에 CPU를 얼마나 썼는지(recent_cpu)를 1초마다 재계산
+ * recent_cpu = (2*load_avg)/(2*load_avg+1) * recent_cpu + nice
+ *
+ * (2*load_avg)/(2*load_avg+1) : load_avg가 클수록 계수 값이 1에 가까워짐.
+ * 시스템이 붐빌수록 과거 recent_cpu 값이 더 오래 유지됨. 붐비는 환경에서는 CPU 많이 쓴 스레드가 더 오랫동안 벌점 유지
+ *
+ * recent_cpu : 과거 CPU 사용량을 계수만큼 남겨 둠.
+ *
+ * + nice : nice가 클수록 recent_cpu가 더 커져서 우선순위가 내려감.
+ *
+ * -> 시스템이 붐빌수록 과거 사용량을 더 오래 기억, nice가 클수록 벌점 추가.
+ */
+void mlfqs_recent_cpu(struct thread *t) {
+    if (t == idle_thread)
+        return;
+    int two_la = FP_MUL_INT(load_avg, 2);
+    int coeff = FP_DIV_FP(two_la, FP_ADD_INT(two_la, 1));
+    t->recent_cpu = FP_ADD_INT(FP_MUL_FP(coeff, t->recent_cpu), t->nice);
+}
+
+/**
+ * MLFQS의 우선순위(priority)를 재계산
+ * 최근 CPU 사용량(recent_cpu) 과 양보 성향(nice) 을 이용해, 스레드의 동적 우선순위를 다시 정수로 만들어 저장
+ * 수식 : priority = PRI_MAX - (recent_cpu/4) - (nice*2)
+ *
+ * 수식의 이유
+ * recent_cpu/4 : 최근에 많이 쓴 스레드는 잠시 뒤로
+ * recent_cpu는 “최근 CPU 사용량”임. 이를 4로 나눠 적당히 완화한 값을 빼서 우선순위를 낮춤
+ * 너무 크게 빼면 급격히 떨어지고, 너무 작으면 효과가 미미하기 때문. “4”는 전통적으로 쓰이는 완화 상수
+ * 그리고 priority는 정수여야 하므로, 명세대로 0 쪽으로 절사하여 일관된 값을 만듦
+ *
+ * −2×nice : 양보 성향을 반영
+ * nice가 클수록 “양보적” -> 우선순위를 더 낮춰야 함. 계수 2는 영향도를 조절하는 상수
+ *
+ * PRI_MAX에서 빼는 구조 : 점수 높을수록 먼저
+ * 우선순위는 값이 클수록 더 우선임
+ * 최대치(PRI_MAX) 에서 “벌점들(recent_cpu/4, 2×nice)”을 뺀 값을 쓰면
+ * 최근에 많이 쓴 스레드, 양보가 큰 스레드는 조금 뒤로 밀림
+ * 반대로, 최근 사용이 적고 양보가 작은(또는 음수) 스레드는 앞으로 감
+ *
+ * CLAMP : 계산 결과가 범위를 벗어날 수 있어, 항상 최소/최대로 잘라주기
+ */
+void mlfqs_priority(struct thread *t) {
+    // idle 스레드는 계산 대상이 아님
+    if (t == idle_thread)
+        return;
+    int pr = PRI_MAX - FP_TO_INT_ZERO(FP_DIV_INT(t->recent_cpu, 4)) - (t->nice * 2);
+    t->priority = CLAMP_PRI(pr);
+}
+
+// MLFQS에서 모든 스레드의 recent_cpu, priority를 주기적으로 재계산, READY 큐(우선순위 정렬)를 즉시 갱신
+void mlfqs_recalc_all_recent_cpu_and_priority(void) {
+    // 초 경계인지를 판단. TIMER_FREQ가 “초당 틱 수”(예: 100)라면, 매 TIMER_FREQ번째 틱마다 true
+    bool second_boundary = (timer_ticks() % TIMER_FREQ == 0);
+    // 임계 구역 진입
+    enum intr_level old = intr_disable();
+
+    struct list_elem *e;
+    // 시스템 내 모든 스레드를 훑음
+    for (e = list_begin(&all_list); e != list_end(&all_list); e = list_next(e)) {
+        struct thread *t = list_entry(e, struct thread, allelem);
+        // 초 경계라면 해당 스레드의 recent_cpu 재계산
+        if (second_boundary) {
+            mlfqs_recent_cpu(t);
+        }
+        // 항상 우선순위를 재계산
+        mlfqs_priority(t);
+    }
+
+    // 현재 스레드가 낮아졌고 top이 더 높으면 선점 표시
+    if (!list_empty(&ready_list)) {
+        list_sort(&ready_list, compare_thread_priority, NULL);
+
+        struct thread *top = list_entry(list_front(&ready_list), struct thread, elem);
+        if (top->priority > thread_current()->priority) {
+            intr_yield_on_return(); // 인터럽트 리턴 직전 양보
+        }
+    }
+
+    intr_set_level(old);
 }

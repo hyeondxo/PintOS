@@ -175,21 +175,29 @@ void lock_acquire(struct lock *lock) {
     ASSERT(!lock_held_by_current_thread(lock));
     struct thread *cur = thread_current();
 
-    // 락에 이미 소유자가 있고 그게 나 자신이 아니라면 나는 이 락을 기다리는 상태가 됨
-    if (lock->holder && lock->holder != cur) {
-        // 내가 지금 어떤 락을 기다리는지 표시(기부 체인 추적용)
-        cur->wait_on_lock = lock;
-        // 현재 스레드의 높은 우선순위를 락 소유자에게 기부하고
-        // 소유자가 또다른 락을 기다리면 그 소유자에게도 연쇄적으로 기부를 전파함
-        // -> 우선순위 역전 방지 목적
-        donate_priority_chain(lock->holder);
+    // MLFQS방식일 경우
+    // 우선순위는 donation이 아니라 MLFQS 수식(priority) 으로 매번 자동 재계산됨
+    // 즉 priority는 고정 값이 아니라 동적 값이라 donation을 해도 의미가 없으므로 비활성 해야함
+    if (!thread_mlfqs) {
+        // 락에 이미 소유자가 있고 그게 나 자신이 아니라면 나는 이 락을 기다리는 상태가 됨
+        if (lock->holder && lock->holder != cur) {
+            // 내가 지금 어떤 락을 기다리는지 표시(기부 체인 추적용)
+            cur->wait_on_lock = lock;
+            // 현재 스레드의 높은 우선순위를 락 소유자에게 기부하고
+            // 소유자가 또다른 락을 기다리면 그 소유자에게도 연쇄적으로 기부를 전파함
+            // -> 우선순위 역전 방지 목적
+            donate_priority_chain(lock->holder);
+        }
     }
     // 락 내부의 세마포어를 내려 자원을 획득
     sema_down(&lock->semaphore); // 자원 획득까지 대기
-    // 더이상 락을 기다리는 상태가 아님. 표시 해제
-    cur->wait_on_lock = NULL;
-    lock->holder = cur;                            // 이제 이 락의 소유자는 나임
-    list_push_back(&cur->held_locks, &lock->elem); // 내가 보유중인 락 목록에 이 락을 추가
+
+    if (!thread_mlfqs) {
+        // 더이상 락을 기다리는 상태가 아님. 표시 해제
+        cur->wait_on_lock = NULL;
+        list_push_back(&cur->held_locks, &lock->elem); // 내가 보유중인 락 목록에 이 락을 추가
+    }
+    lock->holder = cur; // 이제 이 락의 소유자는 나임
 }
 
 /* LOCK을 시도(acquire)하고, 성공 시 true, 실패 시 false 반환.
@@ -231,9 +239,15 @@ void lock_release(struct lock *lock) {
     struct thread *cur = thread_current();
 
     lock->holder = NULL; // 소유자 해제
-    list_remove(&lock->elem);
-    remove_donation_for_lock(cur, lock);
-    refresh_priority(cur);
+    // Priority Donation 모드
+    if (!thread_mlfqs) {
+        // 나의 락 목록에서 제거
+        list_remove(&lock->elem);
+        // 이 락 때문에 받은 donation 제거
+        remove_donation_for_lock(cur, lock);
+        // 내 priority를 원래 값으로 갱신
+        refresh_priority(cur);
+    }
 
     sema_up(&lock->semaphore); // 대기자 하나 깨우고 자원 반환
 }

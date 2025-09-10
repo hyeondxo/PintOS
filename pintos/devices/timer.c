@@ -157,6 +157,18 @@ static void timer_interrupt(struct intr_frame *args UNUSED) {
         // READY로 깨워 준비 큐에 삽입(인터럽트 컨텍스트에서는 수면 불가)
         thread_unblock(t);
     }
+
+    /* 2) MLFQS 갱신(있을 때만) */
+    if (thread_mlfqs) {
+        mlfqs_increment(); /* 매 틱: running(=idle 제외) recent_cpu += 1 */
+
+        if (ticks % TIMER_FREQ == 0) {
+            mlfqs_load_avg();                           /* 1초마다 */
+            mlfqs_recalc_all_recent_cpu_and_priority(); /* 전체 recent_cpu + priority */
+        } else if (ticks % 4 == 0) {
+            mlfqs_recalc_all_recent_cpu_and_priority(); /* 4틱마다 priority만 갱신 분기 */
+        }
+    }
 }
 
 /* 주어진 반복 횟수(LOOPS)가 한 틱을 초과하는지 판정: 초과하면 true, 아니면 false */

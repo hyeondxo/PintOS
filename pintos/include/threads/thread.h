@@ -82,19 +82,18 @@ struct thread {
     enum thread_status status; /* 스레드 상태(READY/RUNNING/BLOCKED/DYING). 스케줄러가 참조. */
     char name[16];             /* 스레드 이름(디버깅 및 로깅 용도). 최대 15자+NULL. */
     int priority;              /* 스케줄링 우선순위(PRI_MIN~PRI_MAX). 높을수록 우선. */
+    int64_t wake_tick;         // 깨울 시각
+    int base_priority;         // 현재 스레드의 원래 우선순위
+    int nice;                  /* 보통 -20..+20 범위(테스트 기준에 맞추되 클램프) */
+    int recent_cpu;            /* FP 고정소수점 값(예: 17.14 형식) */
 
-    /* thread.c와 synch.c에서 공유하여 사용 */
-    struct list_elem elem; /* 실행 큐 또는 동기화 대기열에 들어갈 리스트 노드 */
-
-    int64_t wake_tick;           // 깨울 시각
-    struct list_elem sleep_elem; // 수면 리스트 노드
-
-    int base_priority;              // 현재 스레드의 원래 우선순위
     struct lock *wait_on_lock;      // 현재 스레드가 획득 대기 중인 락 포인터 - 어떤 락을 얻기 위함인지?
     struct list donations;          // 나에게 우선순위를 기부한 스레드들 리스트
+    struct list held_locks;         // 내가 현재 보유중인 락들의 리스트
+    struct list_elem elem;          /* 실행 큐 또는 동기화 대기열에 들어갈 리스트 노드 */
+    struct list_elem sleep_elem;    // 수면 리스트 노드
     struct list_elem donation_elem; // donation 리스트 전용 손잡이(중요)
-
-    struct list held_locks; // 내가 현재 보유중인 락들의 리스트
+    struct list_elem allelem;       // 전체 스레드 순회용
 
 #ifdef USERPROG
     /* userprog/process.c에서 관리 */
@@ -151,5 +150,12 @@ bool compare_thread_priority(const struct list_elem *a, const struct list_elem *
 void donate_priority_chain(struct thread *donee);
 
 void refresh_priority(struct thread *t);
+
+/* MLFQS API (thread.c에서 구현) */
+void mlfqs_priority(struct thread *t);
+void mlfqs_recent_cpu(struct thread *t);
+void mlfqs_load_avg(void);
+void mlfqs_increment(void);
+void mlfqs_recalc_all_recent_cpu_and_priority(void);
 
 #endif /* threads/thread.h */
