@@ -9,6 +9,10 @@
 #include "vm/vm.h"
 #endif
 
+#ifdef USERPROG
+struct file;
+#endif
+
 /* 스레드 생애주기 상태 집합 */
 enum thread_status {
     THREAD_RUNNING, /* 실행 중인 스레드 */
@@ -98,6 +102,7 @@ struct thread {
 #ifdef USERPROG
     /* userprog/process.c에서 관리 */
     uint64_t *pml4; /* 사용자 주소 공간의 최상위 페이지 테이블(PML4) 포인터 */
+    struct file *running_file; /* exec 후 성공적으로 열린 실행 파일(deny write 유지용) */
 #endif
 #ifdef VM
     /* 이 스레드가 소유한 전체 가상 메모리를 추적하는 보조 페이지 테이블 */

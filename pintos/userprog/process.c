@@ -6,6 +6,7 @@
 #include "threads/flags.h"
 #include "threads/init.h"
 #include "threads/interrupt.h"
+#include "threads/loader.h"
 #include "threads/mmu.h"
 #include "threads/palloc.h"
 #include "threads/thread.h"
@@ -22,16 +23,28 @@
 #include "vm/vm.h"
 #endif
 
+/*
+ * Pintos 부트로더가 전달할 수 있는 전체 커맨드 라인 길이는 LOADER_ARGS_LEN(=128)으로 제한된다.
+ * 공백으로 구분된 인자 수는 해당 길이의 절반을 넘지 않으므로 안전한 최대 argc를 미리 계산해 둔다.
+ */
+#define MAX_ARGS (LOADER_ARGS_LEN / 2 + 1)
+
 static void process_cleanup(void);
 static bool load(const char *file_name, struct intr_frame *if_);
 static void initd(void *f_name);
 static void __do_fork(void *);
+static void argument_stack(char **argv, int argc, struct intr_frame *if_);
 
 /* initd 및 그 외 프로세스를 위한 공통 초기화 함수
  * - 현재 스레드의 프로세스 레벨 공용 초기화 지점을 제공합니다.
  * - 필요 시 향후 프로세스별 초기화 항목(예: 파일 디스크립터 테이블 초기화)을
  *   이 함수에 추가하면 됩니다. */
-static void process_init(void) { struct thread *current = thread_current(); }
+static void process_init(void) {
+    struct thread *current = thread_current();
+#ifdef USERPROG
+    current->running_file = NULL;
+#endif
+}
 
 /* 첫 번째 유저랜드 프로그램 "initd"를 FILE_NAME에서 로드하여 시작합니다.
  * - init 프로세스 생성의 진입점입니다.
@@ -44,6 +57,16 @@ tid_t process_create_initd(const char *file_name) {
     char *fn_copy;
     tid_t tid;
 
+    char thread_name[16]; // 스레드 이름을 잠시 담아둘 버퍼
+    char *save_ptr;       // strtok_r이 다음 토큰 위치를 기억할 수 있게 해주는 저장용 포인터
+
+    // 원본 문자열 file_name을 위에서 만든 버퍼로 복사
+    strlcpy(thread_name, file_name, sizeof thread_name);
+    // 복사해둔 문자열을 공백을 기준으로 잘라 첫 번째 토큰을 구함
+    char *first_token = strtok_r(thread_name, " ", &save_ptr);
+    if (first_token == NULL)
+        first_token = thread_name;
+
     /* FILE_NAME의 복사본을 만듭니다.
      * - 호출자가 넘긴 문자열 버퍼의 라이프사이클과 load()의 사용 시점이 겹치지 않도록
      *   별도의 페이지에 안전하게 복사합니다. (경쟁 상태 방지) */
@@ -54,7 +77,10 @@ tid_t process_create_initd(const char *file_name) {
 
     /* FILE_NAME을 실행할 새 스레드를 생성합니다.
      * - 스레드의 시작 함수로 initd를 지정합니다. */
-    tid = thread_create(file_name, PRI_DEFAULT, initd, fn_copy);
+    // 이름이 first_token인 새 스레드를 기본 우선순위로 만들어 initd 함수로부터 실행하되
+    // 그 함수의 인자로 준비해 둔 프로그램 문자열 복사본을 넘기는 호출
+    // 반환값은 새 스레드의 ID임
+    tid = thread_create(first_token, PRI_DEFAULT, initd, fn_copy);
     if (tid == TID_ERROR)
         palloc_free_page(fn_copy);
     return tid;
@@ -193,6 +219,26 @@ error:
 int process_exec(void *f_name) {
     char *file_name = f_name;
     bool success;
+    char *argv[MAX_ARGS];  // 최대 인자 개수만큼 문자열 포인터를 담을 배열
+    int argc = 0;          // 현재까지 파싱한 인재 개수 카운트
+    char *save_ptr = NULL; // strtok_r이 다음 토큰 위치를 기억할 때 쓰는 상태 변수
+    char *token;           // 방금 잘라낸 토큰의 주소를 담을 포인터 변수
+
+    // file_name에서 공백을 기준으로 차례차례 잘라가며 토큰을 꺼냄. 더 이상 토큰이 없으면 루프가 끝남
+    for (token = strtok_r(file_name, " ", &save_ptr); token != NULL; token = strtok_r(NULL, " ", &save_ptr)) {
+        // 최대 인자를 초과하면 동적 할당했던 커맨드 문자열 페이지를 해제
+        if (argc >= MAX_ARGS) {
+            palloc_free_page(file_name);
+            return -1; // 실패 반환
+        }
+        // 초과가 아니라면 지금 토큰의 시작 주소를 배열에 저장하고 argc를 1 증가
+        argv[argc++] = token;
+    }
+    // 한 개의 토큰도 나오지 않았을 경우 -> 해제, 실패
+    if (argc == 0) {
+        palloc_free_page(file_name);
+        return -1;
+    }
 
     /* 스레드 구조체에 있는 intr_frame은 사용할 수 없습니다.
      * 현재 스레드가 리스케줄될 때, 실행 정보가 그 멤버에 저장되기 때문입니다.
@@ -208,12 +254,19 @@ int process_exec(void *f_name) {
 
     /* 그 다음 바이너리를 로드합니다.
      * - load()는 ELF를 검사하고, 세그먼트를 매핑하고, 초기 스택을 구성합니다. */
-    success = load(file_name, &_if);
+    // 파싱한 인자 중 첫 번째 항목인 프로그램 이름을 넘겨 ELF 실행 파일을 로드하고
+    // 결과 레지스터 값을 _if에 채움
+    success = load(argv[0], &_if);
 
-    /* 로드에 실패한 경우 종료합니다. */
-    palloc_free_page(file_name);
-    if (!success)
+    if (!success) {
+        palloc_free_page(file_name);
         return -1;
+    }
+
+    // 파싱해둔 인자 목록을 바탕으로 사용자 스택과 레지스터를 세팅
+    argument_stack(argv, argc, &_if);
+    // 커맨드 문자열 버퍼는 더이상 쓸 일이 없음
+    palloc_free_page(file_name);
 
     /* 전환된 프로세스를 시작합니다.
      * - do_iret()은 _if에 적힌 유저 레지스터로 복귀(유저 모드 점프)합니다. */
@@ -233,6 +286,9 @@ int process_exec(void *f_name) {
 int process_wait(tid_t child_tid UNUSED) {
     /* XXX: 힌트) pintos는 process_wait (initd)에서 종료됩니다.
      * XXX:       process_wait을 구현하기 전에는 여기 무한 루프를 넣는 것을 권장합니다. */
+    // -> 무한루프 구현. 이 루프를 끝내기 위한 qemu 종료는 ctrl+c 이후 x
+    while (1) {
+    }
     return -1;
 }
 
@@ -255,6 +311,12 @@ void process_exit(void) {
  * - 커널 전용 페이지 디렉터리로 안전하게 전환 후 파괴 */
 static void process_cleanup(void) {
     struct thread *curr = thread_current();
+
+    /* 실행 중이던 ELF 파일 핸들을 닫아 재사용/삭제 시 충돌을 방지한다. */
+    if (curr->running_file != NULL) {
+        file_close(curr->running_file);
+        curr->running_file = NULL;
+    }
 
 #ifdef VM
     supplemental_page_table_kill(&curr->spt);
@@ -452,16 +514,65 @@ static bool load(const char *file_name, struct intr_frame *if_) {
      * - ELF 엔트리 포인트를 rip에 적어 유저 모드가 시작될 위치를 지정합니다. */
     if_->rip = ehdr.e_entry;
 
-    /* TODO: 여기에 코드를 작성하세요.
-     * TODO: 인자 전달을 구현하세요 (project2/argument_passing.html 참조).
-     * - argv/argc 문자열 배치, 8바이트 정렬, 가짜 리턴 주소, rdi/rsi 세팅 등 */
     success = true;
 
 done:
-    /* 로드 성공 여부와 관계없이 여기로 도달합니다.
-     * - 열었던 실행 파일 핸들을 닫습니다. */
-    file_close(file);
+    if (!success) {
+        if (file != NULL)
+            file_close(file);
+    } else {
+        struct thread *current = thread_current();
+        /* 성공적으로 적재한 실행 파일은 종료 시까지 열어 두어야 하므로 스레드에 보관한다. */
+        current->running_file = file;
+    }
     return success;
+}
+
+/**
+ * exec가 성공한 직후 사용자 프로그래밍 기대하는 방식에 맞춰 스택과 레지스터를 정리한다
+ */
+static void argument_stack(char **argv, int argc, struct intr_frame *if_) {
+    // 방금 스택에 복사한 각 문자열의 시작 주소를 기억해두기 위한 임시 배열 나중에 argv 테이블을 만들 때 사용
+    char *arg_addr[MAX_ARGS];
+
+    // 인자를 뒤에서부터 하나씩 꺼내 스택에 복사
+    for (int i = argc - 1; i >= 0; --i) {
+        // rsp를 문자열 길이(+NULL)만큼 내리고, 그 위치에 argv[i] 문자열을 그대로 복사
+        size_t len = strlen(argv[i]) + 1;
+        if_->rsp -= len;
+        memcpy((void *)if_->rsp, argv[i], len);
+        // 복사된 위치의 주소를 arg_addr[i]로 기억한다
+        arg_addr[i] = (char *)if_->rsp;
+    }
+
+    // 현재 rsp가 8의 배수가 될 때까지 한 바이트씩 0을 채워 넣는다
+    while (if_->rsp % 8 != 0) {
+        if_->rsp -= 1;
+        *(uint8_t *)if_->rsp = 0;
+    }
+
+    // argv[argc] = NULL 규칙을 지키기 위해 포인터 하나를 더 push
+    if_->rsp -= sizeof(char *);
+    *(char **)(if_->rsp) = NULL;
+
+    // 마찬가지로 역순으로 진행하며 arg_addr에 저장해 둔 각 문자열 주소를 스택에 push
+    for (int i = argc - 1; i >= 0; --i) {
+        if_->rsp -= sizeof(char *);
+        *(char **)(if_->rsp) = arg_addr[i];
+    }
+
+    // 결과는 현재 rsp가 argv[0] 위치를 가리키게 되고 나중에 레지스터에 넣어줄 값이 됨
+    char **argv_base = (char **)if_->rsp;
+
+    // main 함수가 return했을 때 돌아갈 곳이 없으므로, 0(Null 주소)로 채워 사용자가 잘못된 리턴을 시도했을 때 곧바로
+    // 예외가 발생하도록 한다
+    if_->rsp -= sizeof(void *);
+    *(void **)(if_->rsp) = 0;
+
+    // 유저 mode 진입 시 argc/argv는 RDI/RSI 레지스터로 전달된다
+    // 호출 규약에 맞게 첫 번째 인자(argc)는 RDI, 두 번째 인자(argv)는 RSI에 넣는다
+    if_->R.rdi = (uint64_t)argc;
+    if_->R.rsi = (uint64_t)argv_base;
 }
 
 /* PHDR이 FILE 안에서 유효하고 로드 가능한 세그먼트를 기술하는지 검사합니다.
