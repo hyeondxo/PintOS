@@ -101,6 +101,7 @@ struct thread {
 
 #ifdef USERPROG
     /* userprog/process.c에서 관리 */
+    int exit_status;            /* 최근 exit(status) 값. 기본 -1, exit() 성공 시 갱신 */
     uint64_t *pml4; /* 사용자 주소 공간의 최상위 페이지 테이블(PML4) 포인터 */
     struct file *running_file; /* exec 후 성공적으로 열린 실행 파일(deny write 유지용) */
 #endif

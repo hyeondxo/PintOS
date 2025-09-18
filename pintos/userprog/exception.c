@@ -70,6 +70,7 @@ static void kill(struct intr_frame *f) {
         /* 유저 코드 세그먼트에서 발생 → 유저 예외 → 유저 프로세스 종료 */
         printf("%s: dying due to interrupt %#04llx (%s).\n", thread_name(), f->vec_no, intr_name(f->vec_no));
         intr_dump_frame(f); // 예외 당시 레지스터/스택 상태 출력
+        thread_current()->exit_status = -1; // 비정상 예외 종료이므로 실패 코드 유지
         thread_exit();      // 현재 스레드 종료
 
     case SEL_KCSEG:

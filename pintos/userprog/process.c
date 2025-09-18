@@ -42,6 +42,7 @@ static void argument_stack(char **argv, int argc, struct intr_frame *if_);
 static void process_init(void) {
     struct thread *current = thread_current();
 #ifdef USERPROG
+    current->exit_status = -1; // 사용자 프로세스 기본 종료 코드를 실패(-1)로 시작
     current->running_file = NULL;
 #endif
 }
@@ -248,6 +249,8 @@ int process_exec(void *f_name) {
     _if.cs = SEL_UCSEG;
     _if.eflags = FLAG_IF | FLAG_MBS; /* 인터럽트 허용 + 반드시 1이어야 하는 비트 */
 
+    thread_current()->exit_status = -1; // exec 직후에도 기본값을 -1로 재설정(이전 상태 잔재 제거)
+
     /* 먼저 현재 컨텍스트를 정리합니다.
      * - 기존 주소 공간/리소스 파괴(유저 공간 해제) */
     process_cleanup();
@@ -286,9 +289,6 @@ int process_exec(void *f_name) {
 int process_wait(tid_t child_tid UNUSED) {
     /* XXX: 힌트) pintos는 process_wait (initd)에서 종료됩니다.
      * XXX:       process_wait을 구현하기 전에는 여기 무한 루프를 넣는 것을 권장합니다. */
-    // -> 무한루프 구현. 이 루프를 끝내기 위한 qemu 종료는 ctrl+c 이후 x
-    while (1) {
-    }
     return -1;
 }
 
@@ -298,11 +298,8 @@ int process_wait(tid_t child_tid UNUSED) {
  * - 주소 공간 해제(process_cleanup 호출) */
 void process_exit(void) {
     struct thread *curr = thread_current();
-    /* TODO: 여기에 코드를 작성하세요.
-     * TODO: 프로젝트 문서(project2/process_termination.html)에 따라
-     * TODO: 프로세스 종료 메시지를 구현하세요.
-     * TODO: 프로세스 자원 정리를 여기서 수행하는 것을 권장합니다. */
-
+    if (curr->pml4 != NULL)
+        printf("%s: exit(%d)\n", curr->name, curr->exit_status); // 사용자 프로세스 종료 메시지 출력
     process_cleanup();
 }
 
