@@ -13,6 +13,8 @@
 struct file;
 #endif
 
+#define FD_TABLE_SIZE 128 /* 프로세스당 동시에 열 수 있는 파일 핸들 상한 */
+
 /* 스레드 생애주기 상태 집합 */
 enum thread_status {
     THREAD_RUNNING, /* 실행 중인 스레드 */
@@ -104,6 +106,7 @@ struct thread {
     int exit_status;            /* 최근 exit(status) 값. 기본 -1, exit() 성공 시 갱신 */
     uint64_t *pml4; /* 사용자 주소 공간의 최상위 페이지 테이블(PML4) 포인터 */
     struct file *running_file; /* exec 후 성공적으로 열린 실행 파일(deny write 유지용) */
+    struct file *fd_table[FD_TABLE_SIZE]; /* fd 번호 → file 객체 매핑 테이블 (0/1은 표준 입출력 전용) */
 #endif
 #ifdef VM
     /* 이 스레드가 소유한 전체 가상 메모리를 추적하는 보조 페이지 테이블 */

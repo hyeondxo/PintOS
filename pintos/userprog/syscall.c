@@ -1,38 +1,54 @@
 #include "userprog/syscall.h"
 #include "devices/input.h"
+#include "filesys/file.h"
+#include "filesys/filesys.h"
 #include "intrinsic.h"
-#include <stddef.h>
 #include "lib/kernel/stdio.h"
 #include "threads/flags.h"
 #include "threads/init.h"
 #include "threads/interrupt.h"
 #include "threads/loader.h"
 #include "threads/mmu.h"
+#include "threads/synch.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 #include "userprog/gdt.h"
 #include <debug.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <syscall-nr.h>
 
 void syscall_entry(void);                  // 어셈블리 레벨에서 정의된 syscall 진입점 (intrinsic.asm 등)
 void syscall_handler(struct intr_frame *); // 실제 C 레벨에서 시스템 콜을 처리하는 함수
 
-#define STDIN_FILENO 0
-#define STDOUT_FILENO 1
-#define IO_CHUNK 256
+#define STDIN_FILENO 0   // 표준 입력 파일 디스크립터
+#define STDOUT_FILENO 1  // 표준 출력 파일 디스크립터
+#define IO_CHUNK 256     // 사용자 버퍼를 한 번에 처리할 최대 바이트 수
+#define MAX_PATH_LEN 128 // open 경로 문자열을 임시 보관할 커널 버퍼 크기(널 포함)
 
-static void die_bad_access(void) NO_RETURN;                     // 잘못된 유저 주소 접근 시 즉시 프로세스 종료
-static bool get_user_u8(uint8_t *dst, const uint8_t *uaddr);    // 단일 바이트 안전 읽기
-static bool put_user_u8(uint8_t *uaddr, uint8_t value);         // 단일 바이트 안전 쓰기
-static void copy_in(void *dst, const void *usrc, size_t size);  // 사용자->커널 버퍼 복사
-static void copy_out(void *udst, const void *src, size_t size); // 커널->사용자 버퍼 복사
+static void die_bad_access(void) NO_RETURN;                           // 잘못된 유저 주소 접근 시 즉시 프로세스 종료
+static bool get_user_u8(uint8_t *dst, const uint8_t *uaddr);          // 단일 바이트 안전 읽기
+static bool put_user_u8(uint8_t *uaddr, uint8_t value);               // 단일 바이트 안전 쓰기
+static void copy_in(void *dst, const void *usrc, size_t size);        // 사용자->커널 버퍼 복사
+static void copy_out(void *udst, const void *src, size_t size);       // 커널->사용자 버퍼 복사
+static void copy_in_string(char *dst, const char *usrc, size_t size); // 사용자 문자열을 NUL까지 안전 복사
 
 static void sys_halt(void) NO_RETURN;
 static void sys_exit(int status) NO_RETURN;
 static int sys_write(int fd, const void *ubuf, size_t size);
 static int sys_read(int fd, void *ubuf, size_t size);
+static int sys_open(const char *ufile);
+static int sys_filesize(int fd);
+static void sys_seek(int fd, unsigned position);
+static unsigned sys_tell(int fd);
+static void sys_close(int fd);
+
+static struct file *fd_to_file(int fd);
+static int alloc_fd(struct file *file);
+static void free_fd(int fd);
+
+struct lock filesys_lock; // 파일 시스템 API 호출을 직렬화하기 위한 전역 락
 
 /* 시스템 콜.
  *
@@ -87,20 +103,42 @@ void syscall_handler(struct intr_frame *f) {
     uint64_t arg3 = f->R.rdx;       // 세 번째 인자: RDX
 
     switch (syscall_no) {
-    case SYS_HALT: // 커널 전원을 즉시 종료
+    case SYS_HALT: // halt(): 인자 없음. 커널 전원을 즉시 종료
         sys_halt();
         NOT_REACHED();
 
-    case SYS_EXIT: // 현재 프로세스 종료 및 상태 기록
+    case SYS_EXIT: // exit(status): RDI=status. 현재 프로세스를 종료하고 종료 코드를 기록
         sys_exit((int)arg1);
         NOT_REACHED();
 
-    case SYS_WRITE:                                                                  // 표준 출력(write)에 대해서만 처리
-        f->R.rax = (uint64_t)sys_write((int)arg1, (const void *)arg2, (size_t)arg3); // 반환값을 RAX에 기록
+    case SYS_WRITE: // write(fd, buf, size): RDI=fd, RSI=buf, RDX=size. 쓰기 결과 바이트 수를 RAX에 저장
+        f->R.rax = (uint64_t)sys_write((int)arg1, (const void *)arg2, (size_t)arg3);
         break;
 
-    case SYS_READ: // 표준 입력(read)에 대해서만 처리
+    case SYS_READ: // read(fd, buf, size): RDI=fd, RSI=buf, RDX=size. 읽은 바이트 수를 RAX에 저장
         f->R.rax = (uint64_t)sys_read((int)arg1, (void *)arg2, (size_t)arg3);
+        break;
+
+    case SYS_OPEN: // open(path): RDI=사용자 문자열 포인터. 성공 시 새 fd를 RAX로 반환
+        f->R.rax = (uint64_t)sys_open((const char *)arg1);
+        break;
+
+    case SYS_FILESIZE: // filesize(fd): RDI=fd. 파일 길이를 RAX로 반환
+        f->R.rax = (uint64_t)sys_filesize((int)arg1);
+        break;
+
+    case SYS_SEEK: // seek(fd, position): RDI=fd, RSI=next offset. 반환값 없음(RAX=0)
+        sys_seek((int)arg1, (unsigned)arg2);
+        f->R.rax = 0;
+        break;
+
+    case SYS_TELL: // tell(fd): RDI=fd. 현재 오프셋을 RAX로 반환
+        f->R.rax = (uint64_t)sys_tell((int)arg1);
+        break;
+
+    case SYS_CLOSE: // close(fd): RDI=fd. fd를 닫고 RAX=0
+        sys_close((int)arg1);
+        f->R.rax = 0;
         break;
 
     default: // 미지원 syscall → 즉시 실패 종료
@@ -192,6 +230,22 @@ static void copy_out(void *udst, const void *src, size_t size) {
     }
 }
 
+/* 사용자 문자열을 커널 버퍼로 복사하면서 널 문자를 반드시 확인한다. */
+static void copy_in_string(char *dst, const char *usrc, size_t size) {
+    if (size == 0)
+        die_bad_access();
+
+    for (size_t i = 0; i < size; i++) {
+        uint8_t byte;                                       // 임시로 한 바이트 저장할 버퍼
+        if (!get_user_u8(&byte, (const uint8_t *)usrc + i)) // 사용자 주소 usrc+i에서 안전하게 1바이트 읽기
+            die_bad_access();                               // 읽기에 실패하면 즉시 프로세스 종료
+        dst[i] = byte;                                      // 커널 버퍼에 복사
+        if (byte == '\0')                                   // 널 종단을 만났다면 문자열 복사가 완료된 것
+            return;                                         // 호출자에게 성공적으로 반환
+    }
+    die_bad_access(); // size 이내에서 널 문자를 찾지 못하면 잘못된 문자열로 간주
+}
+
 /**
  * 사용자 프로그램이 halt 시스템 콜을 호출했을 때 곧바로 pintos를 종료. 정상복귀 x
  */
@@ -219,23 +273,47 @@ static int sys_write(int fd, const void *ubuf, size_t size) {
     if (fd == STDOUT_FILENO) {    // 표준 출력 : 1
         size_t written = 0;       // 현재까지 출력한 총 바이트 수
         uint8_t buffer[IO_CHUNK]; // 최대 IO_CHUNK 크기의 임시 커널 버퍼
-        // 남은 데이터가 있으면 반복
         while (written < size) {
-            // 한 번에 처리할 크기 제한
             size_t chunk = size - written;
             if (chunk > IO_CHUNK)
                 chunk = IO_CHUNK;
 
-            // 유저 버퍼를 안전하게 복사
             copy_in(buffer, (const uint8_t *)ubuf + written, chunk);
-            // 콘솔에 출력
             putbuf((const char *)buffer, chunk);
-            written += chunk; // 쓴 양 갱신
+            written += chunk;
         }
         return (int)size; // 모두 다 썼다면 크기 반환
     }
 
-    return -1;
+    if (fd == STDIN_FILENO)
+        return -1; // 표준 입력으로의 쓰기는 허용하지 않음
+
+    struct file *file = fd_to_file(fd);
+    if (file == NULL)
+        return -1; // 유효하지 않은 fd이면 오류 반환
+
+    size_t written = 0;       // 누적 출력 바이트 수
+    uint8_t buffer[IO_CHUNK]; // 사용자 버퍼를 임시로 담을 커널 버퍼
+
+    while (written < size) {
+        size_t chunk = size - written;
+        if (chunk > IO_CHUNK)
+            chunk = IO_CHUNK; // 한 번에 처리할 최대 크기 제한
+
+        copy_in(buffer, (const uint8_t *)ubuf + written, chunk); // 사용자 버퍼를 안전하게 복사
+
+        lock_acquire(&filesys_lock);                 // 파일 시스템 접근 직전 전역 락 획득
+        int bytes = file_write(file, buffer, chunk); // 실제 파일 쓰기
+        lock_release(&filesys_lock);                 // 쓰기 완료 후 즉시 락 해제
+
+        if (bytes <= 0)
+            break;        // 더 이상 쓸 수 없는 경우 종료
+        written += bytes; // 실제 쓴 양만큼 누적
+        if ((size_t)bytes < chunk)
+            break; // 부분만 쓴 경우(예: 공간 부족) 종료
+    }
+
+    return (int)written; // 총 출력 바이트 수 반환
 }
 
 /**
@@ -255,15 +333,147 @@ static int sys_read(int fd, void *ubuf, size_t size) {
             if (chunk > IO_CHUNK)
                 chunk = IO_CHUNK;
 
-            // 키도브에서 문자를 받아 buffer에 채우기
             for (size_t i = 0; i < chunk; i++)
                 buffer[i] = input_getc();
-            // 방금 읽은 내용을 사용자 버퍼로 안전 복사
             copy_out((uint8_t *)ubuf + read_bytes, buffer, chunk);
             read_bytes += chunk;
         }
         return (int)size;
     }
 
+    if (fd == STDOUT_FILENO)
+        return -1; // 표준 출력으로부터의 읽기는 허용하지 않음
+
+    struct file *file = fd_to_file(fd);
+    if (file == NULL)
+        return -1; // 잘못된 fd -> 오류 반환
+
+    size_t read_bytes = 0;    // 누적 읽은 바이트 수
+    uint8_t buffer[IO_CHUNK]; // 한 번에 읽어올 임시 커널 버퍼
+
+    while (read_bytes < size) {
+        size_t chunk = size - read_bytes;
+        if (chunk > IO_CHUNK)
+            chunk = IO_CHUNK; // 읽기 단위를 IO_CHUNK 이하로 제한
+
+        lock_acquire(&filesys_lock);                // 파일 시스템 접근 직전 락 획득
+        int bytes = file_read(file, buffer, chunk); // 실제 파일에서 읽기 수행
+        lock_release(&filesys_lock);                // 읽기 완료 후 즉시 락 해제
+
+        if (bytes <= 0)
+            break; // EOF 또는 오류 -> 루프 종료
+
+        copy_out((uint8_t *)ubuf + read_bytes, buffer, bytes); // 커널 버퍼를 사용자 버퍼로 복사
+        read_bytes += bytes;                                   // 누적 읽은 양 업데이트
+        if ((size_t)bytes < chunk)
+            break; // chunk보다 덜 읽었으면 추가 데이터 없음
+    }
+
+    return (int)read_bytes; // 실제 읽은 바이트 수 반환
+}
+
+/* 사용자 경로 문자열을 검증 후 파일을 열어 새 fd를 할당한다. */
+static int sys_open(const char *ufile) {
+    char path[MAX_PATH_LEN];                  // 커널 측 경로 버퍼
+    copy_in_string(path, ufile, sizeof path); // 사용자 문자열을 안전하게 복사
+
+    if (path[0] == '\0') // 빈 문자열은 허용하지 않음
+        return -1;
+
+    lock_acquire(&filesys_lock);            // 파일 시스템 접근 보호
+    struct file *file = filesys_open(path); // 파일 열기 시도
+    if (file == NULL) {
+        lock_release(&filesys_lock); // 실패하면 락 해제 후 -1
+        return -1;
+    }
+
+    int fd = alloc_fd(file); // 새 fd 슬롯 할당
+    if (fd == -1) {
+        file_close(file); // 슬롯 없음 -> 파일 닫기
+        lock_release(&filesys_lock);
+        return -1;
+    }
+
+    lock_release(&filesys_lock); // 파일 등록 완료 후 락 해제
+    return fd;                   // 성공 시 새 fd 반환
+}
+
+/* 열린 파일의 총 길이를 조회한다. 실패 시 -1 반환. */
+static int sys_filesize(int fd) {
+    struct file *file = fd_to_file(fd); // fd에 해당하는 파일 객체 조회
+    if (file == NULL)
+        return -1; // 잘못된 fd면 -1 반환
+
+    lock_acquire(&filesys_lock);
+    int length = file_length(file); // 파일 시스템에서 길이 가져오기
+    lock_release(&filesys_lock);
+    return length; // 길이를 그대로 반환
+}
+
+/* 파일 오프셋을 지정 위치로 이동한다. 존재하지 않는 fd는 무시. */
+// position : 다음 읽기/쓰기 오프셋으로 설정할 파일 내 바이트 위치
+static void sys_seek(int fd, unsigned position) {
+    struct file *file = fd_to_file(fd); // fd에 대응하는 파일 객체 조회
+    if (file == NULL)
+        return; // 잘못된 fd면 아무 것도 하지 않음
+
+    lock_acquire(&filesys_lock); // 파일 위치 변경은 파일 시스템 락으로 보호
+    file_seek(file, position);   // 지정한 위치로 오프셋 이동
+    lock_release(&filesys_lock);
+}
+
+/* 현재 파일 오프셋을 반환하고, 실패 시 (unsigned)-1을 돌려준다. */
+static unsigned sys_tell(int fd) {
+    struct file *file = fd_to_file(fd);
+    if (file == NULL)
+        return (unsigned)-1;
+
+    lock_acquire(&filesys_lock); // 위치 조회 전 파일 시스템 락 획득
+    off_t pos = file_tell(file); // 현재 파일 오프셋 얻기
+    lock_release(&filesys_lock);
+    if (pos < 0)
+        return (unsigned)-1; // 오류 시 unsigned -1 반환
+    return (unsigned)pos;    // 정상 시 위치를 unsigned로 캐스팅해 반환
+}
+
+/* 파일 디스크립터를 닫고 슬롯을 비운다. 표준 입출력은 무시. */
+static void sys_close(int fd) {
+    if (fd < 2)
+        return; // 표준 입출력(0,1)은 닫지 않음
+
+    struct file *file = fd_to_file(fd);
+    if (file == NULL)
+        return; // 이미 닫힌 fd는 무시
+
+    free_fd(fd); // fd 테이블에서 슬롯 비우기
+
+    lock_acquire(&filesys_lock); // 파일 시스템 접근 보호
+    file_close(file);            // 마지막 참조라면 파일 객체까지 정리
+    lock_release(&filesys_lock);
+}
+
+/* fd -> file* 매핑 테이블에서 파일 객체를 조회한다. */
+static struct file *fd_to_file(int fd) {
+    if (fd < 2 || fd >= FD_TABLE_SIZE)
+        return NULL;                       // fd가 유효 범위를 벗어나면 NULL 반환
+    return thread_current()->fd_table[fd]; // 해당 fd 슬롯에 저장된 file 포인터 반환
+}
+
+/* 가장 작은 사용 가능한 fd 번호를 찾아 file 포인터를 등록한다. */
+static int alloc_fd(struct file *file) {
+    struct thread *t = thread_current();
+    for (int fd = 2; fd < FD_TABLE_SIZE; fd++) {
+        if (t->fd_table[fd] == NULL) {
+            t->fd_table[fd] = file;
+            return fd;
+        }
+    }
     return -1;
+}
+
+/* fd 범위가 올바른 경우 테이블에서 해당 슬롯을 비워 중복 닫기를 방지한다. */
+static void free_fd(int fd) {
+    if (fd < 2 || fd >= FD_TABLE_SIZE)
+        return;
+    thread_current()->fd_table[fd] = NULL;
 }

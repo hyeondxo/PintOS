@@ -11,7 +11,9 @@
 #include "threads/palloc.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
+#include "threads/synch.h"
 #include "userprog/gdt.h"
+#include "userprog/syscall.h"
 #include "userprog/tss.h"
 #include <debug.h>
 #include <inttypes.h>
@@ -44,6 +46,7 @@ static void process_init(void) {
 #ifdef USERPROG
     current->exit_status = -1; // 사용자 프로세스 기본 종료 코드를 실패(-1)로 시작
     current->running_file = NULL;
+    memset(current->fd_table, 0, sizeof current->fd_table); // fd 2~127 슬롯을 모두 비워 새 주소 공간에서 깨끗하게 시작
 #endif
 }
 
@@ -300,6 +303,26 @@ void process_exit(void) {
     struct thread *curr = thread_current();
     if (curr->pml4 != NULL)
         printf("%s: exit(%d)\n", curr->name, curr->exit_status); // 사용자 프로세스 종료 메시지 출력
+
+#ifdef USERPROG
+    for (int fd = 2; fd < FD_TABLE_SIZE; fd++) {
+        struct file *file = curr->fd_table[fd];
+        if (file != NULL) {
+            lock_acquire(&filesys_lock);              // 파일 시스템 접근을 전역 락으로 직렬화
+            file_close(file);                         // 마지막 참조라면 inode write counter가 감소하면서 정리됨
+            lock_release(&filesys_lock);
+            curr->fd_table[fd] = NULL;                // 계정에서 fd 슬롯 비우기(중복 close 방지)
+        }
+    }
+
+    if (curr->running_file != NULL) {
+        lock_acquire(&filesys_lock);                  // 실행 파일에 걸어둔 deny_write를 해제하면서 닫기
+        file_allow_write(curr->running_file);
+        file_close(curr->running_file);
+        lock_release(&filesys_lock);
+        curr->running_file = NULL;
+    }
+#endif
     process_cleanup();
 }
 
@@ -308,12 +331,6 @@ void process_exit(void) {
  * - 커널 전용 페이지 디렉터리로 안전하게 전환 후 파괴 */
 static void process_cleanup(void) {
     struct thread *curr = thread_current();
-
-    /* 실행 중이던 ELF 파일 핸들을 닫아 재사용/삭제 시 충돌을 방지한다. */
-    if (curr->running_file != NULL) {
-        file_close(curr->running_file);
-        curr->running_file = NULL;
-    }
 
 #ifdef VM
     supplemental_page_table_kill(&curr->spt);
@@ -519,6 +536,7 @@ done:
             file_close(file);
     } else {
         struct thread *current = thread_current();
+        file_deny_write(file); // 실행 중에는 해당 파일에 대한 쓰기를 막아 self-modifying 문제 방지
         /* 성공적으로 적재한 실행 파일은 종료 시까지 열어 두어야 하므로 스레드에 보관한다. */
         current->running_file = file;
     }
