@@ -9,10 +9,12 @@
 #include "threads/interrupt.h"
 #include "threads/loader.h"
 #include "threads/mmu.h"
+#include "threads/palloc.h"
 #include "threads/synch.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 #include "userprog/gdt.h"
+#include "userprog/process.h"
 #include <debug.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -25,7 +27,7 @@ void syscall_handler(struct intr_frame *); // 실제 C 레벨에서 시스템 �
 #define STDIN_FILENO 0   // 표준 입력 파일 디스크립터
 #define STDOUT_FILENO 1  // 표준 출력 파일 디스크립터
 #define IO_CHUNK 256     // 사용자 버퍼를 한 번에 처리할 최대 바이트 수
-#define MAX_PATH_LEN 128 // open 경로 문자열을 임시 보관할 커널 버퍼 크기(널 포함)
+#define MAX_PATH_LEN 512 // 파일/프로그램 경로 임시 버퍼 크기(널 포함)
 
 static void die_bad_access(void) NO_RETURN;                           // 잘못된 유저 주소 접근 시 즉시 프로세스 종료
 static bool get_user_u8(uint8_t *dst, const uint8_t *uaddr);          // 단일 바이트 안전 읽기
@@ -35,7 +37,6 @@ static void copy_out(void *udst, const void *src, size_t size);       // 커널-
 static void copy_in_string(char *dst, const char *usrc, size_t size); // 사용자 문자열을 NUL까지 안전 복사
 
 static void sys_halt(void) NO_RETURN;
-static void sys_exit(int status) NO_RETURN;
 static int sys_write(int fd, const void *ubuf, size_t size);
 static int sys_read(int fd, void *ubuf, size_t size);
 static int sys_open(const char *ufile);
@@ -43,6 +44,11 @@ static int sys_filesize(int fd);
 static void sys_seek(int fd, unsigned position);
 static unsigned sys_tell(int fd);
 static void sys_close(int fd);
+static bool sys_create(const char *ufile, unsigned initial_size);
+static bool sys_remove(const char *ufile);
+static void sys_exec(const char *ucommand) NO_RETURN;
+static int sys_wait(tid_t pid);
+static tid_t sys_fork(const char *uname, struct intr_frame *f);
 
 static struct file *fd_to_file(int fd);
 static int alloc_fd(struct file *file);
@@ -64,6 +70,8 @@ struct lock filesys_lock; // 파일 시스템 API 호출을 직렬화하기 위�
 #define MSR_SYSCALL_MASK 0xc0000084 /* SYSCALL 시 EFLAGS에서 마스킹할 비트들을 저장하는 MSR */
 
 void syscall_init(void) {
+    lock_init(&filesys_lock); // 파일 시스템 연산을 직렬화할 전역 락 준비
+
     /* MSR_STAR:
      *   상위 16비트에 "유저 모드 코드 세그먼트 - 0x10" 값이,
      *   하위 16비트에 "커널 모드 코드 세그먼트" 값이 기록됩니다.
@@ -97,6 +105,7 @@ void syscall_init(void) {
  *     알맞은 시스템 콜 함수를 호출해야 합니다.
  */
 void syscall_handler(struct intr_frame *f) {
+    // 유저 프로그램이 syscall 인스트럭션은 실행하면 시스템콜 번호는 rax 레지스터에 담겨 넘어옴
     uint64_t syscall_no = f->R.rax; // 시스템 콜 번호는 RAX에 위치
     uint64_t arg1 = f->R.rdi;       // 첫 번째 인자: RDI
     uint64_t arg2 = f->R.rsi;       // 두 번째 인자: RSI
@@ -111,11 +120,31 @@ void syscall_handler(struct intr_frame *f) {
         sys_exit((int)arg1);
         NOT_REACHED();
 
-    case SYS_WRITE: // write(fd, buf, size): RDI=fd, RSI=buf, RDX=size. 쓰기 결과 바이트 수를 RAX에 저장
+    case SYS_FORK: // fork(name): RDI=스레드 이름. 부모는 자식 tid, 자식은 0 반환
+        f->R.rax = (uint64_t)sys_fork((const char *)arg1, f);
+        break;
+
+    case SYS_EXEC: // exec(cmd): RDI=커맨드 문자열. 성공 시 현재 프로세스를 새 프로그램으로 교체
+        sys_exec((const char *)arg1);
+        NOT_REACHED();
+
+    case SYS_WAIT: // wait(pid): RDI=자식 tid. 종료 상태 반환
+        f->R.rax = (uint64_t)sys_wait((tid_t)arg1);
+        break;
+
+    case SYS_CREATE: // create(path, size)
+        f->R.rax = sys_create((const char *)arg1, (unsigned)arg2);
+        break;
+
+    case SYS_REMOVE: // remove(path)
+        f->R.rax = sys_remove((const char *)arg1);
+        break;
+
+    case SYS_WRITE: // write(fd, buf, size): RDI=fd, RSI=buf, RDX=size. STDOUT 또는 열린 파일에 기록
         f->R.rax = (uint64_t)sys_write((int)arg1, (const void *)arg2, (size_t)arg3);
         break;
 
-    case SYS_READ: // read(fd, buf, size): RDI=fd, RSI=buf, RDX=size. 읽은 바이트 수를 RAX에 저장
+    case SYS_READ: // read(fd, buf, size): RDI=fd, RSI=buf, RDX=size. STDIN 또는 열린 파일에서 읽기
         f->R.rax = (uint64_t)sys_read((int)arg1, (void *)arg2, (size_t)arg3);
         break;
 
@@ -254,7 +283,7 @@ static void sys_halt(void) { power_off(); }
 /**
  * 현재 스레드의 exit_status 필드에 전달된 값을 저장하고 자원 정리
  */
-static void sys_exit(int status) {
+void sys_exit(int status) {
     struct thread *t = thread_current();
     t->exit_status = status; // process_exit()에서 출력할 종료 코드를 미리 저장
     thread_exit();           // thread_exit() -> process_exit() 경유
@@ -450,6 +479,71 @@ static void sys_close(int fd) {
     lock_acquire(&filesys_lock); // 파일 시스템 접근 보호
     file_close(file);            // 마지막 참조라면 파일 객체까지 정리
     lock_release(&filesys_lock);
+}
+
+/**
+ * 사용자로부터 받은 파일 경로와 초기 크기를 바탕으로 새 파일을 생성
+ * ufile : 사용자 공간의 문자열 포인터(생성할 파일 경로)
+ * initial_size : 새 파일의 초기 바이트 크기
+ * 반환 : 생성 성공 시 true. 실패 시 false
+ */
+static bool sys_create(const char *ufile, unsigned initial_size) {
+    char path[MAX_PATH_LEN];                  // 커널 공간에 경로 문자열을 담을 임시 버퍼
+    copy_in_string(path, ufile, sizeof path); // ufile로부터 커널 버퍼 path로 문자열을 안전 복사
+    if (path[0] == '\0')                      // 빈 문자열은 파일 이름으로 허용하지 x
+        return false;
+    lock_acquire(&filesys_lock);
+    bool ok = filesys_create(path, initial_size); // 실제 파일 시스템 계층에 파일 생성 요청
+    lock_release(&filesys_lock);
+    return ok;
+}
+
+// 사용자로부터 받은 경로의 파일을 파일시스템에서 삭제
+static bool sys_remove(const char *ufile) {
+    char path[MAX_PATH_LEN];
+    copy_in_string(path, ufile, sizeof path);
+    if (path[0] == '\0')
+        return false;
+    lock_acquire(&filesys_lock);
+    bool ok = filesys_remove(path);
+    lock_release(&filesys_lock);
+    return ok;
+}
+
+/**
+ * 현재 프로세스의 이미지를 새로운 실행 파일로 교체. 성공하면 반환하지 않고 새 프로그램으로 점프 실패하면 프로세스 종료
+ * ucommand : 사용자 공간의 문자열 포인터 - 프로그램 경로와 인자를 포함한 커맨드 라인
+ */
+static void sys_exec(const char *ucommand) {
+    // 전체 커맨드 라인을 담기 위해 한 페이지(4KB) 크기의 커널 버퍼를 페이지 할당자로 확보
+    // exec는 인자 길이가 길 수 있어 스택의 고정 소형 버퍼 대신 페이지 단위의 버퍼를 사용
+    char *cmdline = palloc_get_page(0);
+    if (cmdline == NULL) // 메모리 부족으로 버퍼 확보 실패
+        sys_exit(-1);
+
+    copy_in_string(cmdline, ucommand, PGSIZE); // ucommand -> cmdline으로 복사
+
+    // 프로세스 주소 공간을 비우고(기존 프로그램 폐기), cmdline으로 지정한 실행 파일을 로드한 뒤 인자 스택을 구성하고
+    // 유저 모드로 점프할 준비를 함. 성공 시 이 호출은 실제로 반환하지 않고 do_iret로 넘어감
+    int rc = process_exec(cmdline);
+    if (rc == -1)
+        sys_exit(-1);
+
+    NOT_REACHED();
+}
+
+// 현재 프로세스가 지정한 자식 프로세스의 종료를 기다리고 그 자식의 종료 코드를 반환
+// pid : 기다릴 대상 자식의 프로세스 ID(tid)
+static int sys_wait(tid_t pid) { return process_wait(pid); }
+
+// 현재 프로세스를 복제. 부모는 새 자식의 tid를, 자식은 0을 받도록 구성
+static tid_t sys_fork(const char *uname, struct intr_frame *f) {
+    char name[16];                            // 자식 스레드의 이름을 담을 커널 측 임시 버퍼
+    copy_in_string(name, uname, sizeof name); // 사용자(uname) -> 커널 버퍼로 name을 안전 복사
+    tid_t tid = process_fork(name, f);        // 부모의 intr_frame f와 복사한 이름을 넘겨 실제 fork 수행
+    if (tid == TID_ERROR)
+        return -1;
+    return tid;
 }
 
 /* fd -> file* 매핑 테이블에서 파일 객체를 조회한다. */

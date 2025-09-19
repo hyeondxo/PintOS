@@ -3,6 +3,7 @@
 #include "threads/interrupt.h"
 #include "threads/thread.h"
 #include "userprog/gdt.h"
+#include "userprog/syscall.h"
 #include <inttypes.h>
 #include <stdio.h>
 
@@ -67,11 +68,12 @@ static void kill(struct intr_frame *f) {
     /* 예외가 어디서 발생했는지는 코드 세그먼트 값(cs)으로 구분할 수 있습니다. */
     switch (f->cs) {
     case SEL_UCSEG:
+        sys_exit(-1); // bad-* 테스트 통과용. 커널 패닉이 아닌 -1로 프로세스 종료
         /* 유저 코드 세그먼트에서 발생 → 유저 예외 → 유저 프로세스 종료 */
         printf("%s: dying due to interrupt %#04llx (%s).\n", thread_name(), f->vec_no, intr_name(f->vec_no));
-        intr_dump_frame(f); // 예외 당시 레지스터/스택 상태 출력
+        intr_dump_frame(f);                 // 예외 당시 레지스터/스택 상태 출력
         thread_current()->exit_status = -1; // 비정상 예외 종료이므로 실패 코드 유지
-        thread_exit();      // 현재 스레드 종료
+        thread_exit();                      // 현재 스레드 종료
 
     case SEL_KCSEG:
         /* 커널 코드 세그먼트에서 발생 → 커널 내부 버그임.
