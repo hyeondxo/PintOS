@@ -499,13 +499,16 @@ static void init_thread(struct thread *t, const char *name, int priority) {
     t->magic = THREAD_MAGIC;   // 매직 값 설정(오버플로 감지)
 
 #ifdef USERPROG
-    list_init(&t->children);   // 부모 입장에서 관리할 자식 목록 초기화
-    t->child_info = NULL;      // 내가 가진 child_process 노드(부모가 만든 것) 초기값
-    t->parent = NULL;          // 부모 스레드 포인터 초기화(최초에는 없음)
+    list_init(&t->children);
+    t->child_info = NULL;
+    t->parent = NULL;
 #endif
 
     t->nice = 0;                  /* 기본값 */
     t->recent_cpu = INT_TO_FP(0); /* 0 */
+
+    t->exit_status = 0;
+
 
     list_push_back(&all_list, &t->allelem); /* 모든 스레드 목록에 등록 */
 }

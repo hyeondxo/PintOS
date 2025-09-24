@@ -12,8 +12,8 @@
 #include_next <stdio.h>
 
 /* Predefined file handles. */
-#define STDIN_FILENO 0
-#define STDOUT_FILENO 1
+#define STDIN_FILENO 0 // 표준 입력 FD
+#define STDOUT_FILENO 1 // 표준 출력 FD
 
 /* Standard functions. */
 int printf (const char *, ...) PRINTF_FORMAT (1, 2);
