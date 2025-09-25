@@ -28,3 +28,7 @@ core
 
 # macOS
 .DS_Store
+
+# Local configuration
+make.config
+.devcontainer/
